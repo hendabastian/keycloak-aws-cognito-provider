@@ -1,0 +1,8 @@
+target/
+output/
+*.class
+*.jar
+!output/.gitkeep
+.idea/
+*.iml
+.DS_Store

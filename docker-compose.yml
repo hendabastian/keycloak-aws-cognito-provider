@@ -1,0 +1,14 @@
+services:
+  builder:
+    image: maven:3.9.6-eclipse-temurin-17
+    working_dir: /project
+    volumes:
+      - .:/project
+      - maven-cache:/root/.m2
+    command: >
+      mvn clean package -DskipTests
+    entrypoint: >
+      sh -c "mvn clean package -DskipTests && mkdir -p /project/output && cp /project/target/keycloak-cognito-provider.jar /project/output/"
+
+volumes:
+  maven-cache:
