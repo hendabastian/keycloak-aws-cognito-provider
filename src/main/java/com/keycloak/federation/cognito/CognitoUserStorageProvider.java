@@ -8,6 +8,7 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserCredentialModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.UserProvider;
 import org.keycloak.models.credential.PasswordCredentialModel;
 import org.keycloak.storage.StorageId;
 import org.keycloak.storage.UserStorageProvider;
@@ -68,13 +69,6 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
     public UserModel getUserByUsername(RealmModel realm, String username) {
         logger.infof("Looking up user '%s' in Cognito user pool", username);
 
-        // First check if the user already exists locally (e.g., from a previous lookup in the same flow)
-        UserModel existingUser = session.users().getUserByUsername(realm, username);
-        if (existingUser != null) {
-            logger.infof("User '%s' already exists locally, skipping Cognito lookup", username);
-            return existingUser;
-        }
-
         try {
             AdminGetUserRequest request = AdminGetUserRequest.builder()
                     .userPoolId(userPoolId)
@@ -107,27 +101,31 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
 
     @Override
     public UserModel getUserById(RealmModel realm, String id) {
-        // Check if this is a federated ID (contains the provider component ID)
         StorageId storageId = new StorageId(id);
         String externalId = storageId.getExternalId();
         logger.debugf("getUserById called with externalId '%s'", externalId);
-
-        // Check if user already exists locally first
-        UserModel existingUser = session.users().getUserByUsername(realm, externalId);
-        if (existingUser != null) {
-            return existingUser;
-        }
-
         return getUserByUsername(realm, externalId);
     }
 
     /**
      * Creates a local Keycloak user from the Cognito user data.
+     * Uses UserProvider directly to avoid re-entering the federation provider chain.
      */
     private UserModel createKeycloakUser(RealmModel realm, AdminGetUserResponse cognitoUser) {
         String username = cognitoUser.username();
 
-        UserModel localUser = session.users().addUser(realm, username);
+        // Access the local UserProvider directly to bypass the federation chain
+        // This prevents infinite recursion (StackOverflowError)
+        UserProvider userProvider = session.getProvider(UserProvider.class);
+
+        // Check if user already exists locally (handles repeated calls within same flow)
+        UserModel localUser = userProvider.getUserByUsername(realm, username);
+        if (localUser != null) {
+            logger.infof("User '%s' already exists locally, returning existing user", username);
+            return localUser;
+        }
+
+        localUser = userProvider.addUser(realm, username);
         localUser.setEnabled(true);
         localUser.setFederationLink(model.getId());
 
