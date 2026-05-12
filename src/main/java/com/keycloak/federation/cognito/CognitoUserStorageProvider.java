@@ -68,6 +68,13 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
     public UserModel getUserByUsername(RealmModel realm, String username) {
         logger.infof("Looking up user '%s' in Cognito user pool", username);
 
+        // First check if the user already exists locally (e.g., from a previous lookup in the same flow)
+        UserModel existingUser = session.users().getUserByUsername(realm, username);
+        if (existingUser != null) {
+            logger.infof("User '%s' already exists locally, skipping Cognito lookup", username);
+            return existingUser;
+        }
+
         try {
             AdminGetUserRequest request = AdminGetUserRequest.builder()
                     .userPoolId(userPoolId)
@@ -100,9 +107,17 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
 
     @Override
     public UserModel getUserById(RealmModel realm, String id) {
+        // Check if this is a federated ID (contains the provider component ID)
         StorageId storageId = new StorageId(id);
         String externalId = storageId.getExternalId();
         logger.debugf("getUserById called with externalId '%s'", externalId);
+
+        // Check if user already exists locally first
+        UserModel existingUser = session.users().getUserByUsername(realm, externalId);
+        if (existingUser != null) {
+            return existingUser;
+        }
+
         return getUserByUsername(realm, externalId);
     }
 
