@@ -33,6 +33,8 @@ public class CognitoUserStorageProviderFactory implements UserStorageProviderFac
     public static final String CONFIG_REGION = "cognitoRegion";
     public static final String CONFIG_ACCESS_KEY = "cognitoAccessKey";
     public static final String CONFIG_SECRET_KEY = "cognitoSecretKey";
+    public static final String CONFIG_WEBHOOK_URL = "webhookUrl";
+    public static final String CONFIG_WEBHOOK_AUTH_HEADER = "webhookAuthHeader";
 
     private static final List<ProviderConfigProperty> CONFIG_PROPERTIES;
 
@@ -75,6 +77,19 @@ public class CognitoUserStorageProviderFactory implements UserStorageProviderFac
                     .type(ProviderConfigProperty.PASSWORD)
                     .label("AWS Secret Access Key (optional)")
                     .helpText("AWS Secret Access Key. If left empty, the default credential provider chain will be used (recommended for EC2/ECS).")
+                    .secret(true)
+                    .add()
+                .property()
+                    .name(CONFIG_WEBHOOK_URL)
+                    .type(ProviderConfigProperty.STRING_TYPE)
+                    .label("Password Change Webhook URL (optional)")
+                    .helpText("URL to call when a user's password is updated (e.g., forgot password). Receives a POST with JSON body: {\"username\": \"...\", \"password\": \"...\"}. Leave empty to disable.")
+                    .add()
+                .property()
+                    .name(CONFIG_WEBHOOK_AUTH_HEADER)
+                    .type(ProviderConfigProperty.PASSWORD)
+                    .label("Webhook Authorization Header (optional)")
+                    .helpText("Value for the Authorization header sent with the webhook request (e.g., 'Bearer your-token' or 'Basic base64...'). Leave empty for no auth.")
                     .secret(true)
                     .add()
                 .build();

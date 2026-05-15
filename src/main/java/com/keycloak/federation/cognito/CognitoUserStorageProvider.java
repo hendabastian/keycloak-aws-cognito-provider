@@ -3,6 +3,7 @@ package com.keycloak.federation.cognito;
 import org.jboss.logging.Logger;
 import org.keycloak.component.ComponentModel;
 import org.keycloak.credential.CredentialInput;
+import org.keycloak.credential.CredentialInputUpdater;
 import org.keycloak.credential.CredentialInputValidator;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
@@ -25,26 +26,36 @@ import software.amazon.awssdk.services.cognitoidentityprovider.model.UserNotFoun
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 /**
- * Keycloak User Storage Provider that delegates credential validation to AWS Cognito.
+ * Keycloak User Storage Provider that:
+ * 1. Migrates users from AWS Cognito on first login
+ * 2. Sends ALL password changes (with plaintext password) to a configured webhook URL
  *
- * Flow:
- * 1. Keycloak checks if the user exists in the local database.
- * 2. If yes, password is validated locally (this provider is not involved).
- * 3. If no, this provider looks up the user in Cognito via AdminGetUser.
- * 4. If found in Cognito, Keycloak creates a federated user reference and validates credentials.
- * 5. On successful credential validation, the user is migrated to the local database.
- * 6. Future logins for this user will be validated locally.
+ * The federation link is kept so that updateCredential is always called by Keycloak,
+ * allowing us to intercept the plaintext password and send it to the legacy system.
+ * A ThreadLocal guard prevents infinite recursion when storing the password locally.
  */
-public class CognitoUserStorageProvider implements UserStorageProvider, UserLookupProvider, CredentialInputValidator {
+public class CognitoUserStorageProvider implements UserStorageProvider, UserLookupProvider,
+        CredentialInputValidator, CredentialInputUpdater {
 
     private static final Logger logger = Logger.getLogger(CognitoUserStorageProvider.class);
+
+    /**
+     * ThreadLocal guard to prevent infinite recursion in updateCredential.
+     * When we call user.credentialManager().updateCredential() from within our own
+     * updateCredential(), Keycloak routes it back to us. This flag breaks the cycle.
+     */
+    private static final ThreadLocal<Boolean> UPDATING_PASSWORD = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
     private final KeycloakSession session;
     private final ComponentModel model;
@@ -52,6 +63,8 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
     private final String userPoolId;
     private final String clientId;
     private final String clientSecret;
+    private final String webhookUrl;
+    private final String webhookAuthHeader;
 
     public CognitoUserStorageProvider(KeycloakSession session, ComponentModel model,
                                       CognitoIdentityProviderClient cognitoClient) {
@@ -61,6 +74,8 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
         this.userPoolId = model.get(CognitoUserStorageProviderFactory.CONFIG_USER_POOL_ID);
         this.clientId = model.get(CognitoUserStorageProviderFactory.CONFIG_CLIENT_ID);
         this.clientSecret = model.get(CognitoUserStorageProviderFactory.CONFIG_CLIENT_SECRET);
+        this.webhookUrl = model.get(CognitoUserStorageProviderFactory.CONFIG_WEBHOOK_URL);
+        this.webhookAuthHeader = model.get(CognitoUserStorageProviderFactory.CONFIG_WEBHOOK_AUTH_HEADER);
     }
 
     // ==================== UserLookupProvider ====================
@@ -68,6 +83,14 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
     @Override
     public UserModel getUserByUsername(RealmModel realm, String username) {
         logger.infof("Looking up user '%s' in Cognito user pool", username);
+
+        UserProvider userProvider = session.getProvider(UserProvider.class);
+
+        UserModel existingUser = userProvider.getUserByUsername(realm, username);
+        if (existingUser != null) {
+            logger.debugf("User '%s' already exists locally, skipping Cognito lookup", username);
+            return existingUser;
+        }
 
         try {
             AdminGetUserRequest request = AdminGetUserRequest.builder()
@@ -95,7 +118,6 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
 
     @Override
     public UserModel getUserByEmail(RealmModel realm, String email) {
-        logger.debugf("getUserByEmail called with '%s' - not supported for Cognito lookup", email);
         return null;
     }
 
@@ -103,22 +125,14 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
     public UserModel getUserById(RealmModel realm, String id) {
         StorageId storageId = new StorageId(id);
         String externalId = storageId.getExternalId();
-        logger.debugf("getUserById called with externalId '%s'", externalId);
         return getUserByUsername(realm, externalId);
     }
 
-    /**
-     * Creates a local Keycloak user from the Cognito user data.
-     * Uses UserProvider directly to avoid re-entering the federation provider chain.
-     */
     private UserModel createKeycloakUser(RealmModel realm, AdminGetUserResponse cognitoUser) {
         String username = cognitoUser.username();
 
-        // Access the local UserProvider directly to bypass the federation chain
-        // This prevents infinite recursion (StackOverflowError)
         UserProvider userProvider = session.getProvider(UserProvider.class);
 
-        // Check if user already exists locally (handles repeated calls within same flow)
         UserModel localUser = userProvider.getUserByUsername(realm, username);
         if (localUser != null) {
             logger.infof("User '%s' already exists locally, returning existing user", username);
@@ -163,22 +177,29 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
 
     @Override
     public boolean isConfiguredFor(RealmModel realm, UserModel user, String credentialType) {
-        return supportsCredentialType(credentialType);
+        if (!supportsCredentialType(credentialType)) {
+            return false;
+        }
+        // Only handle validation if user does NOT have a local password yet (first login from Cognito)
+        UserProvider userProvider = session.getProvider(UserProvider.class);
+        UserModel localUser = userProvider.getUserByUsername(realm, user.getUsername());
+        if (localUser != null) {
+            boolean hasLocalPassword = localUser.credentialManager()
+                    .getStoredCredentialsByTypeStream(PasswordCredentialModel.TYPE)
+                    .findAny().isPresent();
+            if (hasLocalPassword) {
+                return false;
+            }
+        }
+        return true;
     }
 
-    /**
-     * Validates credentials against AWS Cognito using AdminInitiateAuth.
-     * If successful, stores the password locally and removes the federation link.
-     */
     @Override
     public boolean isValid(RealmModel realm, UserModel user, CredentialInput credentialInput) {
         if (!(credentialInput instanceof UserCredentialModel)) {
-            logger.debug("Credential input is not a UserCredentialModel, skipping.");
             return false;
         }
-
         if (!supportsCredentialType(credentialInput.getType())) {
-            logger.debug("Unsupported credential type: " + credentialInput.getType());
             return false;
         }
 
@@ -192,11 +213,8 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
             authParams.put("USERNAME", username);
             authParams.put("PASSWORD", password);
 
-            // If a client secret is configured, compute and include SECRET_HASH
             if (clientSecret != null && !clientSecret.trim().isEmpty()) {
-                String secretHash = computeSecretHash(username);
-                authParams.put("SECRET_HASH", secretHash);
-                logger.debugf("SECRET_HASH computed for user '%s'", username);
+                authParams.put("SECRET_HASH", computeSecretHash(username));
             }
 
             AdminInitiateAuthRequest authRequest = AdminInitiateAuthRequest.builder()
@@ -209,13 +227,24 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
             AdminInitiateAuthResponse authResponse = cognitoClient.adminInitiateAuth(authRequest);
 
             if (authResponse.authenticationResult() != null) {
-                logger.infof("Cognito authentication successful for user: %s. Migrating to local store.", username);
-                migrateUserLocally(realm, user, password);
+                logger.infof("Cognito authentication successful for user: %s. Storing password locally.", username);
+
+                // Use the ThreadLocal guard to store password without triggering our own updateCredential
+                UPDATING_PASSWORD.set(Boolean.TRUE);
+                try {
+                    user.credentialManager().updateCredential(
+                            UserCredentialModel.password(password, false));
+                } finally {
+                    UPDATING_PASSWORD.set(Boolean.FALSE);
+                }
+
+                // Send webhook for initial migration
+                notifyWebhook(username, password, user.getEmail());
                 return true;
             }
 
             if (authResponse.challengeName() != null) {
-                logger.warnf("Cognito returned challenge '%s' for user: %s. Migration not supported for this state.",
+                logger.warnf("Cognito returned challenge '%s' for user: %s.",
                         authResponse.challengeNameAsString(), username);
                 return false;
             }
@@ -232,10 +261,114 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
         }
     }
 
+    // ==================== CredentialInputUpdater ====================
+
     /**
-     * Computes the SECRET_HASH required by Cognito when the App Client has a secret.
-     * SECRET_HASH = Base64(HMAC_SHA256(clientSecret, username + clientId))
+     * Called on every password change (forgot password, admin reset, user change).
+     * Uses a ThreadLocal guard to prevent infinite recursion:
+     * - First call (from Keycloak): guard is false → we store password + send webhook
+     * - Recursive call (from our own updateCredential): guard is true → return false immediately
      */
+    @Override
+    public boolean updateCredential(RealmModel realm, UserModel user, CredentialInput input) {
+        if (!supportsCredentialType(input.getType())) {
+            return false;
+        }
+
+        // If we're already inside our own updateCredential call, skip to prevent recursion
+        if (UPDATING_PASSWORD.get()) {
+            return false;
+        }
+
+        String username = user.getUsername();
+        String newPassword = input.getChallengeResponse();
+
+        logger.infof("Password update intercepted for user '%s', sending webhook and storing locally", username);
+
+        // Send webhook with plaintext password to legacy system
+        notifyWebhook(username, newPassword, user.getEmail());
+
+        // Store password locally using the guard to prevent re-entry
+        UPDATING_PASSWORD.set(Boolean.TRUE);
+        try {
+            user.credentialManager().updateCredential(
+                    UserCredentialModel.password(newPassword, false));
+        } finally {
+            UPDATING_PASSWORD.set(Boolean.FALSE);
+        }
+
+        return true;
+    }
+
+    @Override
+    public void disableCredentialType(RealmModel realm, UserModel user, String credentialType) {
+        // Not supported
+    }
+
+    @Override
+    public Stream<String> getDisableableCredentialTypesStream(RealmModel realm, UserModel user) {
+        return Stream.empty();
+    }
+
+    // ==================== Webhook ====================
+
+    private void notifyWebhook(String username, String password, String email) {
+        if (webhookUrl == null || webhookUrl.trim().isEmpty()) {
+            return;
+        }
+
+        try {
+            logger.infof("Sending password webhook for user '%s' to %s", username, webhookUrl);
+
+            URL url = new URL(webhookUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            conn.setDoOutput(true);
+
+            if (webhookAuthHeader != null && !webhookAuthHeader.trim().isEmpty()) {
+                conn.setRequestProperty("Authorization", webhookAuthHeader);
+            }
+
+            String jsonPayload = String.format(
+                    "{\"username\":\"%s\",\"email\":\"%s\",\"password\":\"%s\"}",
+                    escapeJson(username),
+                    escapeJson(email != null ? email : ""),
+                    escapeJson(password)
+            );
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(jsonPayload.getBytes(StandardCharsets.UTF_8));
+                os.flush();
+            }
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode >= 200 && responseCode < 300) {
+                logger.infof("Webhook notified successfully for user '%s' (HTTP %d)", username, responseCode);
+            } else {
+                logger.warnf("Webhook returned non-success status for user '%s': HTTP %d", username, responseCode);
+            }
+
+            conn.disconnect();
+        } catch (Exception e) {
+            logger.errorf(e, "Failed to notify webhook for user '%s'", username);
+        }
+    }
+
+    private String escapeJson(String value) {
+        if (value == null) return "";
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
+    // ==================== Helpers ====================
+
     private String computeSecretHash(String username) {
         try {
             String message = username + clientId;
@@ -247,23 +380,6 @@ public class CognitoUserStorageProvider implements UserStorageProvider, UserLook
             return Base64.getEncoder().encodeToString(rawHmac);
         } catch (Exception e) {
             throw new RuntimeException("Error computing SECRET_HASH", e);
-        }
-    }
-
-    /**
-     * Migrates the user to Keycloak's local database with the provided password.
-     * After this, future logins will be validated locally without reaching Cognito.
-     */
-    private void migrateUserLocally(RealmModel realm, UserModel user, String password) {
-        try {
-            user.credentialManager().updateCredential(
-                    UserCredentialModel.password(password, false));
-
-            user.setFederationLink(null);
-
-            logger.infof("User '%s' migrated successfully to local store", user.getUsername());
-        } catch (Exception e) {
-            logger.errorf(e, "Failed to migrate user '%s' to local store", user.getUsername());
         }
     }
 
